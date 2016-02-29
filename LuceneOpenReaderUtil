@@ -1,0 +1,298 @@
+import java.io.File;
+import java.io.IOException;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.log4j.Logger;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.SimpleFSDirectory;
+
+/**
+ * 辅助打开lucene 搜索 reader 的类
+ * 
+ * @author rhc
+ *
+ */
+public class LuceneOpenReaderUtil {
+
+	private static final Logger logger = Logger.getLogger(LuceneOpenReaderUtil.class);
+
+	/**
+	 * 缓存文件夹的reader
+	 */
+	private final static Map<String, IndexReader> READER_MAP = new HashMap<String, IndexReader>();
+
+	/**
+	 * 获取reader信号
+	 */
+	private final static Map<String, Semaphore> READER_SEMAPHORE = Collections
+			.synchronizedMap(new HashMap<String, Semaphore>());
+
+	/**
+	 * 拿到一个reader获得一个信号，用于当一个reader需要删除时决定什么时候去删除，因为不能在一个reader在其它线程使用时close
+	 */
+	private final static Map<IndexReader, Semaphore> USE_READER_SEMAPHORE = Collections
+			.synchronizedMap(new HashMap<IndexReader, Semaphore>());
+
+	/**
+	 * 最大的reader数量，有多少个文件夹就会有多少个reader
+	 */
+	private final static int MAX_READER = 5;
+
+	/**
+	 * 一个reader同时被使用最大线程数量
+	 */
+	private final static int MAX_USE_NUM = 100;
+	/**
+	 * 索引已经更新，需要被重新打开的reader需要删除
+	 */
+	private final static Set<IndexReader> DELETE_READER = Collections.synchronizedSet(new HashSet<IndexReader>());
+
+	/**
+	 * 定时更新reader的线程池
+	 */
+	private static final ScheduledExecutorService scheduledThreadPool = Executors.newScheduledThreadPool(MAX_READER);
+
+	/**
+	 * 获取一个文件夹的reader
+	 * 
+	 * @param directoryPath
+	 * @return
+	 * @throws IOException
+	 */
+	public static IndexReader getReader(String directoryPath) throws IOException {
+
+		Semaphore semaphore = getPathSemaphore(directoryPath);
+
+		IndexReader reader = null;
+		// 是否中断
+		boolean interrupt = false;
+		try {
+			semaphore.acquire();
+			reader = getDirectoryReader(directoryPath);
+		} catch (InterruptedException e) {
+			interrupt = true;
+		} finally {
+			if (!interrupt) {
+				semaphore.release();
+			}
+		}
+		return reader;
+	}
+
+	/**
+	 * 获取一个路径的信号
+	 * 
+	 * @param directoryPath
+	 * @return
+	 */
+	private static Semaphore getPathSemaphore(String directoryPath) {
+
+		if (READER_SEMAPHORE.containsKey(directoryPath)) {
+			return READER_SEMAPHORE.get(directoryPath);
+		} else {
+			synchronized (LuceneOpenReaderUtil.class) {
+				if (READER_SEMAPHORE.containsKey(directoryPath)) {
+					return READER_SEMAPHORE.get(directoryPath);
+				}
+				Semaphore semaphore = new Semaphore(1);
+				READER_SEMAPHORE.put(directoryPath, semaphore);
+
+				return semaphore;
+			}
+		}
+	}
+
+	/**
+	 * 获取一个文件夹的reader
+	 * 
+	 * @param directoryPath
+	 * @return
+	 * @throws IOException
+	 * @throws InterruptedException
+	 */
+	private static IndexReader getDirectoryReader(String directoryPath) throws IOException, InterruptedException {
+
+		IndexReader indexReader = null;
+		if (READER_MAP.containsKey(directoryPath)) {
+			indexReader = READER_MAP.get(directoryPath);
+			
+		} else {
+			Directory directory = new SimpleFSDirectory(new File(directoryPath));
+			indexReader = IndexReader.open(directory);
+			READER_MAP.put(directoryPath, indexReader);
+			newReader(indexReader);
+			addNewReaderScheduleExceuteFresh(directoryPath);
+		}
+		useReader(indexReader);
+		return indexReader;
+	}
+
+	/**
+	 * 准备删除一个reader，将该reader放入需要执行删除的readerSet中,不能在重新打开reader时将旧reader删除，
+	 * 其它线程可能依旧在使用该reader
+	 * 
+	 * @param reader
+	 */
+	private static void readyCloseReader(IndexReader reader) {
+		DELETE_READER.add(reader);
+	}
+
+	/**
+	 * 当一个新的reader被创建时
+	 * 
+	 * @param reader
+	 */
+	private static void newReader(IndexReader reader) {
+		Semaphore useSemaphore = new Semaphore(MAX_USE_NUM);
+		USE_READER_SEMAPHORE.put(reader, useSemaphore);
+	}
+
+	/**
+	 * 当一个reader被使用时
+	 * 
+	 * @param reader
+	 * @throws InterruptedException
+	 */
+	private static void useReader(IndexReader reader) throws InterruptedException {
+		Semaphore useSemaphore = null;
+		if (USE_READER_SEMAPHORE.containsKey(reader)) {
+			useSemaphore = USE_READER_SEMAPHORE.get(reader);
+			useSemaphore.acquire();
+		}
+	}
+
+	/**
+	 * 使用完一个reader需要归还
+	 * 
+	 * @param reader
+	 * @throws IOException
+	 */
+	public static void closeReader(IndexReader reader) throws IOException {
+		Semaphore deleteSemphore = null;
+		if (USE_READER_SEMAPHORE.containsKey(reader)) {
+			deleteSemphore = USE_READER_SEMAPHORE.get(reader);
+			deleteSemphore.release();
+			if (deleteSemphore.availablePermits() == MAX_USE_NUM && DELETE_READER.contains(reader)) {
+
+				DELETE_READER.remove(reader);
+				USE_READER_SEMAPHORE.remove(reader);
+				reader.close();
+				logger.info("成功删除一个reader");
+			}
+		}
+	}
+
+	/**
+	 * 尝试直接关闭一个reader，当新生成一个reader如果旧reader没有被使用可以直接关闭,
+	 * 必须要先获取到使用reader的权限后才能使用该函数
+	 * 
+	 * @param reader
+	 * @throws IOException
+	 */
+	private static boolean tryCloseReader(IndexReader reader) {
+		Semaphore deleteSemphore = null;
+		if (USE_READER_SEMAPHORE.containsKey(reader)) {
+			deleteSemphore = USE_READER_SEMAPHORE.get(reader);
+			logger.info("准备删除的reader数量："+DELETE_READER.size());
+			if (deleteSemphore.availablePermits() == MAX_USE_NUM && DELETE_READER.contains(reader) && null != reader) {
+
+				DELETE_READER.remove(reader);
+				USE_READER_SEMAPHORE.remove(reader);
+				try {
+					reader.close();
+					logger.info("成功删除一个reader");
+				} catch (IOException e) {
+					e.printStackTrace();
+				}
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * 加入一个定时更新的reader
+	 */
+	private static void addNewReaderScheduleExceuteFresh(String directoryPath) {
+		FreshReader freshReader = new FreshReader(directoryPath);
+		scheduledThreadPool.scheduleAtFixedRate(freshReader, 120, 120, TimeUnit.SECONDS);
+	}
+
+	/**
+	 * 用以辅助更新reader的工具类
+	 * 
+	 * @author rhc
+	 *
+	 */
+	private static class FreshReader implements Runnable {
+
+		/**
+		 * 需要更新的索引的文件夹
+		 */
+		private String directoryPath;
+
+		public FreshReader(String directoryPath) {
+			this.directoryPath = directoryPath;
+		}
+
+		@Override
+		public void run() {
+			long begin = System.currentTimeMillis();
+			logger.info("开始更新reader:" + this.directoryPath);
+			Directory directory;
+			IndexReader newReader = null;
+			IndexReader oldReader = null;
+			try {
+				oldReader = READER_MAP.get(directoryPath);
+				newReader=oldReader.openIfChanged(oldReader);
+			} catch (IOException e) {
+				logger.error("更新Reader:" + directoryPath + " 出错");
+				e.printStackTrace();
+				return;
+			}
+
+			// 先获取该reader的使用权，再更新该reader
+			Semaphore semaphore = semaphore = READER_SEMAPHORE.get(directoryPath);
+			//
+			if ( null != newReader && null != semaphore) {
+				boolean interup = false;
+				try {
+					semaphore.acquire();
+					//如果旧reader不为空且尝试关闭失败则说明该reader正在使用中，将该reader放入准备删除的池中
+					readyCloseReader(oldReader);
+					tryCloseReader(oldReader);
+					newReader(newReader);
+					READER_MAP.put(directoryPath, newReader);
+					
+				} catch (InterruptedException e) {
+					interup = true;
+					e.printStackTrace();
+				} finally {
+					if (!interup) {
+						semaphore.release();
+					}
+				}
+			} else if(null != newReader){
+				newReader(newReader);
+				READER_MAP.put(directoryPath, newReader);
+			} else if(null == newReader){
+				logger.info(directoryPath+" 未改变，不需要更新");
+			}
+			if(null == semaphore){
+				logger.error(directoryPath+ " 更新找不到信号");
+			}
+
+			logger.info("更新reader:" + this.directoryPath + " 结束,耗时 " + (System.currentTimeMillis() - begin));
+		}
+	}
+}
